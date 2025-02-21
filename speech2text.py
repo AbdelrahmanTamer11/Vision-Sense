@@ -159,4 +159,259 @@ def send_session_to_gemini(session_log, mode):
         print(f"⚠️ Error parsing Gemini response: {e}")
         return []
 
+    # Function to start analysis based on the selected mode and input source
+def start_analysis(mode, input_source):
+    global frame_count, session_log, stop_speech_thread, gemini_qa
+
+    # Reset the stop flag
+    stop_speech_thread = False
+
+    # Start Speech-to-Text in a separate thread
+    speech_thread = threading.Thread(target=speech_to_text)
+    speech_thread.start()
+
+    if input_source == "camera":
+        cap = cv2.VideoCapture(0)
+    else:
+        file_path = filedialog.askopenfilename(filetypes=[("Video Files", "*.mp4 *.avi *.mov")])
+        if not file_path:
+            return
+        cap = cv2.VideoCapture(file_path)
+
+    try:
+        with mp_hands.Hands(min_detection_confidence=0.7, min_tracking_confidence=0.7) as hands, \
+                mp_face_mesh.FaceMesh(min_detection_confidence=0.7, min_tracking_confidence=0.7) as face_mesh:
+
+            while cap.isOpened():
+                ret, frame = cap.read()
+                window_title = f"Emotion Analysis - {mode}"
+
+                if not ret:
+                    break
+
+                # Analyze the emotion using DeepFace
+                emotion_scores = analyze_emotion(frame)
+
+                # Accumulate the emotion percentages over time (for each frame)
+                global emotion_totals
+                for emotion, score in emotion_scores.items():
+                    emotion_totals[emotion] += score
+                frame_count += 1
+
+                # Analyze hand gestures
+                analyze_hands(frame, hands)
+
+                # Analyze eye direction and head movement
+                analyze_face(frame, face_mesh)
+
+                # Find the dominant emotion
+                dominant_emotion = max(emotion_scores, key=emotion_scores.get)
+                dominant_emotion_score = emotion_scores[dominant_emotion]
+
+                # Display the dominant emotion and its percentage
+                emotion_text = f"{dominant_emotion}: {dominant_emotion_score:.2f}%"
+                frame = cv2.putText(frame, emotion_text, (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+                # Display the percentages for all emotions
+                y_offset = 100
+                for emotion, score in emotion_scores.items():
+                    frame = cv2.putText(frame, f"{emotion}: {score:.2f}%", (50, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                        (0, 255, 0), 2)
+                    y_offset += 30
+
+                # Mode-based behavior analysis
+                if mode == "Detective":
+                    log_to_report(mode, f"Detecting: {dominant_emotion} ({dominant_emotion_score:.2f}%)")
+                elif mode == "Student Behavior":
+                    log_to_report(mode, f"Tracking: {dominant_emotion} ({dominant_emotion_score:.2f}%)")
+                elif mode == "Interview":
+                    log_to_report(mode, f"Analyzing: {dominant_emotion} ({dominant_emotion_score:.2f}%)")
+
+                # Display the frame with the predicted emotion and percentages
+                cv2.imshow(window_title, frame)
+
+                if cv2.waitKey(10) & 0xFF == ord('q'):
+                    stop_speech_thread = True
+                    break
+
+    except Exception as e:
+        print(f"⚠️ Error during analysis: {e}")
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+        # Wait for the Speech-to-Text thread to finish
+        speech_thread.join()
+
+        # Send the session log to Gemini
+        gemini_qa = send_session_to_gemini(session_log, mode)
+
+        # Generate the report based on accumulated emotions, body language, and speech
+        generate_report(mode)
+
+
+# Function to generate the report and display it in a GUI
+def generate_report(mode):
+    global emotion_totals, frame_count, hand_gesture_count, eye_direction_count, head_movement_count, session_log, gemini_qa
+
+    if frame_count == 0:  # Avoid division by zero
+        frame_count = 1
+
+    # Calculate the average percentage for each emotion
+    average_emotion_scores = {emotion: score / frame_count for emotion, score in emotion_totals.items()}
+
+    # Create a new window for the report
+    report_window = tk.Tk()
+    report_window.title("Emotion & Behavior Analysis Report")
+    report_window.geometry("1000x600")
+
+    # Add a ScrolledText widget to display the report
+    report_text = scrolledtext.ScrolledText(report_window, wrap=tk.WORD, width=70, height=30)
+    report_text.pack(padx=10, pady=10)
+
+    # Write the report content
+    report_text.insert(tk.END, "Emotion & Behavior Analysis Report\n")
+    report_text.insert(tk.END, "=" * 40 + "\n\n")
+
+    # Write the emotion percentages
+    report_text.insert(tk.END, f"Analysis Mode: {mode}\n\n")
+    for emotion, score in average_emotion_scores.items():
+        report_text.insert(tk.END, f"{emotion.capitalize()}: {score:.2f}%\n")
+
+    # Write the body language analysis
+    report_text.insert(tk.END, "\nBody Language Analysis:\n")
+    report_text.insert(tk.END, f"Tense Hand Gestures: {hand_gesture_count['tense']}\n")
+    report_text.insert(tk.END, f"Relaxed Hand Gestures: {hand_gesture_count['relaxed']}\n")
+    report_text.insert(tk.END, f"Eye Direction (Left): {eye_direction_count['left']}\n")
+    report_text.insert(tk.END, f"Eye Direction (Right): {eye_direction_count['right']}\n")
+    report_text.insert(tk.END, f"Eye Direction (Center): {eye_direction_count['center']}\n")
+    report_text.insert(tk.END, f"Head Movement (Up): {head_movement_count['up']}\n")
+    report_text.insert(tk.END, f"Head Movement (Down): {head_movement_count['down']}\n")
+    report_text.insert(tk.END, f"Head Movement (Still): {head_movement_count['still']}\n")
+
+    # Behavioral analysis based on emotion percentages and body language
+    behavior, actions = analyze_behavior(average_emotion_scores, mode)
+
+    # Write the behavior and action suggestions
+    report_text.insert(tk.END, "\nBehavioral Analysis: \n")
+
+    # Gemini API call for emotion and behavior analysis
+    client = genai.Client(api_key="AIzaSyCEy8plT-PIyPtSpYOnxMVtLWgQnvRMUgo")
+    response = client.models.generate_content(
+        model="gemini-2.0-flash", contents=f"""Based on this Emotion & Behavior Analysis for a {mode}: {analysis}, 
+    use this JSON format to structure the output:
+
+    {{
+        "behavior": "describe overall behavior based on the analysis",
+        "action": "suggest appropriate action"
+    }}
+    """
+    )
+
+    ans = response.text
+    ans = json.loads(ans[8:-4])
+    report_text.insert(tk.END, f"Behavior: {ans['behavior']}\n\n")
+    report_text.insert(tk.END, f"Suggested action: {ans['action']}\n\n")
+
+    # Add speech-to-text analysis
+    report_text.insert(tk.END, "\nSpeech-to-Text Analysis:\n")
+    report_text.insert(tk.END, session_log)
+
+    # Add Gemini Q&A analysis
+    report_text.insert(tk.END, "\n\nGemini Q&A Analysis:\n")
+    for qa in gemini_qa:
+        report_text.insert(tk.END, f"Question: {qa['question']}\n")
+        report_text.insert(tk.END, f"Answer: {qa['answer']}\n")
+        report_text.insert(tk.END, f"Is Correct: {qa['is_correct']}\n")
+        if "correct_answer" in qa:
+            report_text.insert(tk.END, f"Correct Answer: {qa['correct_answer']}\n")
+        report_text.insert(tk.END, "-" * 40 + "\n")
+
+    report_text.insert(tk.END, "\nAnalysis Completed.")
+
+    # Add a "Return to Main Menu" button
+    return_button = tk.Button(report_window, text="Return to Main Menu", font=("Arial", 12),
+                              command=lambda: [report_window.destroy(), show_mode_selector()])
+    return_button.pack(pady=10)
+
+    # Show confirmation message
+    messagebox.showinfo("Report Generated", "Analysis report is displayed in the new window.")
+
+
+# Function to analyze behavior based on emotion percentages and body language
+def analyze_behavior(average_emotion_scores, mode):
+    global hand_gesture_count, eye_direction_count, head_movement_count
+    behavior = ""
+    actions = ""
+    return behavior, actions
+
+
+# Function to create the mode selection GUI
+def show_mode_selector():
+    # Create the main window
+    root = tk.Tk()
+    root.title("Emotion & Behavior Analyzer")
+    root.geometry("1000x600")
+
+    # Label for the instructions
+    label = tk.Label(root, text="Select the Action for Behavior Analysis", font=("Arial", 14))
+    label.pack(pady=20)
+
+    # Function to handle the button click
+    def on_mode_selected(mode):
+        root.destroy()  # Close the GUI
+        show_input_source_selector(mode)  # Show input source selection
+
+    # Buttons for each mode
+    detective_button = tk.Button(root, text="Detective", font=("Arial", 12),
+                                 command=lambda: on_mode_selected("Detective"))
+    detective_button.pack(pady=10)
+
+    student_button = tk.Button(root, text="Student Behavior", font=("Arial", 12),
+                               command=lambda: on_mode_selected("Student Behavior"))
+    student_button.pack(pady=10)
+
+    interview_button = tk.Button(root, text="Interview", font=("Arial", 12),
+                                 command=lambda: on_mode_selected("Interview"))
+    interview_button.pack(pady=10)
+
+    # Add a "Close Project" button
+    close_button = tk.Button(root, text="Close Project", font=("Arial", 12), command=root.destroy)
+    close_button.pack(pady=10)
+
+    # Run the GUI main loop
+    root.mainloop()
+
+
+# Function to create the input source selection GUI
+def show_input_source_selector(mode):
+    # Create the main window
+    root = tk.Tk()
+    root.title("Select Input Source")
+    root.geometry("1000x600")
+
+    # Label for the instructions
+    label = tk.Label(root, text="Select the Input Source for Analysis", font=("Arial", 14))
+    label.pack(pady=20)
+
+    # Function to handle the button click
+    def on_input_source_selected(input_source):
+        root.destroy()  # Close the GUI
+        start_analysis(mode, input_source)  # Start the analysis based on selected mode and input source
+
+    # Buttons for each input source
+    camera_button = tk.Button(root, text="Use Camera", font=("Arial", 12),
+                              command=lambda: on_input_source_selected("camera"))
+    camera_button.pack(pady=10)
+
+    video_button = tk.Button(root, text="Upload Video", font=("Arial", 12),
+                             command=lambda: on_input_source_selected("video"))
+    video_button.pack(pady=10)
+
+    # Run the GUI main loop
+    root.mainloop()
+
+
+# Start the program by showing the mode selector
+show_mode_selector()
 
